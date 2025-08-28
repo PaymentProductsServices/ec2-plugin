@@ -5,8 +5,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import hudson.model.Node;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Future;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -60,8 +58,9 @@ class EC2AbstractSlaveTest {
                         EC2AbstractSlave.DEFAULT_ENCLAVE_ENABLED) {
 
                     @Override
-                    public Future<?> terminate() {
-                        return CompletableFuture.completedFuture(null);
+                    public void terminate() {
+                        // To change body of implemented methods use File | Settings |
+                        // File Templates.
                     }
 
                     @Override
@@ -160,9 +159,7 @@ class EC2AbstractSlaveTest {
                         EC2AbstractSlave.DEFAULT_METADATA_SUPPORTED,
                         EC2AbstractSlave.DEFAULT_ENCLAVE_ENABLED) {
                     @Override
-                    public Future<?> terminate() {
-                        return CompletableFuture.completedFuture(null);
-                    }
+                    public void terminate() {}
 
                     @Override
                     public String getEc2Type() {

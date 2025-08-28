@@ -16,8 +16,6 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.util.ArrayList;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import org.apache.sshd.client.SshClient;
@@ -227,9 +225,7 @@ class InitScriptExecutionTest {
                 EC2AbstractSlave.DEFAULT_METADATA_HOPS_LIMIT,
                 EC2AbstractSlave.DEFAULT_METADATA_SUPPORTED) {
             @Override
-            public Future<?> terminate() {
-                return CompletableFuture.completedFuture(null);
-            }
+            public void terminate() {}
 
             @Override
             public String getEc2Type() {

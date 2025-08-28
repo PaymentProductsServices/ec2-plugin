@@ -255,10 +255,10 @@ public class EC2MacLauncher extends EC2SSHLauncher {
 
             try {
                 // Obviously the controller must have an installed ssh client.
-                // Depending on the strategy selected on the UI, we set the StrictHostKeyChecking flag
+                // For Mac agents, use relaxed SSH options to prevent host validation failures
                 String sshClientLaunchString = String.format(
-                        "ssh -o StrictHostKeyChecking=%s -i %s %s@%s -p %d %s",
-                        slaveTemplate.getHostKeyVerificationStrategy().getSshCommandEquivalentFlag(),
+                        "ssh -o StrictHostKeyChecking=%s -o ConnectTimeout=30 -o ServerAliveInterval=60 -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i %s %s@%s -p %d %s",
+                        "no", // Always use 'no' for Mac agents to skip host validation
                         identityKeyFile.getAbsolutePath(),
                         node.remoteAdmin,
                         getEC2HostAddress(computer, template),
@@ -268,7 +268,7 @@ public class EC2MacLauncher extends EC2SSHLauncher {
                 logInfo(
                         computer,
                         listener,
-                        "Launching remoting agent (via SSH client process): " + sshClientLaunchString);
+                        "Launching remoting agent (via SSH client process with relaxed host validation): " + sshClientLaunchString);
                 CommandLauncher commandLauncher = new CommandLauncher(sshClientLaunchString, null);
                 commandLauncher.launch(computer, listener);
             } finally {

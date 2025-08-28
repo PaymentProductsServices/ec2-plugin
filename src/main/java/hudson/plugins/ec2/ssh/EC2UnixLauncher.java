@@ -29,34 +29,26 @@ import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Computer;
 import hudson.plugins.ec2.EC2Readiness;
 import hudson.plugins.ec2.SlaveTemplate;
-import hudson.plugins.ec2.util.KeyHelper;
-import hudson.plugins.ec2.util.KeyPair;
-import hudson.plugins.ec2.util.SSHClientHelper;
+import hudson.plugins.ec2.EC2HostAddressProvider;
 import hudson.slaves.CommandLauncher;
 import hudson.slaves.ComputerLauncher;
+import hudson.slaves.SlaveComputer;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.attribute.PosixFilePermission;
-import java.time.Duration;
 import java.util.List;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
-import org.apache.commons.lang.StringUtils;
-import org.apache.sshd.client.SshClient;
-import org.apache.sshd.client.session.ClientSession;
-import org.apache.sshd.scp.client.CloseableScpClient;
-import org.apache.sshd.scp.common.helpers.ScpTimestampCommandDetails;
 import software.amazon.awssdk.core.exception.SdkException;
 
 /**
- * {@link ComputerLauncher} that connects to a Unix agent on EC2 by using SSH.
+ * {@link ComputerLauncher} that connects to a Unix agent on EC2 by using local SSH client.
+ * This implementation uses the system's SSH command instead of Java SSH libraries
+ * to avoid potential networking issues with Trilead SSH.
  *
  * @author Kohsuke Kawaguchi
  */
-public class EC2UnixLauncher extends EC2SSHLauncher {
+public class EC2UnixLauncher extends LocalSSHLauncher {
 
     private static final Logger LOGGER = Logger.getLogger(EC2UnixLauncher.class.getName());
 
@@ -79,21 +71,20 @@ public class EC2UnixLauncher extends EC2SSHLauncher {
 
     @Override
     protected void launchScript(EC2Computer computer, TaskListener listener)
-            throws IOException, SdkException, InterruptedException {
+            throws IOException, InterruptedException {
         PrintStream logger = listener.getLogger();
         EC2AbstractSlave node = computer.getNode();
         SlaveTemplate template = computer.getSlaveTemplate();
 
         if (node == null) {
-            throw new IllegalStateException();
+            throw new IllegalStateException("EC2 node is null");
         }
-
-        final long timeout = node.getLaunchTimeoutInMillis();
 
         if (template == null) {
             throw new IOException("Could not find corresponding agent template for " + computer.getDisplayName());
         }
 
+        // Check readiness for nodes that support it
         if (node instanceof EC2Readiness readinessNode) {
             int tries = readinessTries;
 
@@ -102,192 +93,212 @@ public class EC2UnixLauncher extends EC2SSHLauncher {
                     break;
                 }
 
-                logInfo(
-                        computer,
-                        listener,
-                        "Node still not ready. Current status: " + readinessNode.getEc2ReadinessStatus());
+                logInfo(computer, listener, "Node still not ready. Current status: " + readinessNode.getEc2ReadinessStatus());
                 Thread.sleep(readinessSleepMs);
             }
 
             if (!readinessNode.isReady()) {
-                throw SdkException.builder()
-                        .message("Node still not ready, timed out after " + (readinessTries * readinessSleepMs / 1000)
-                                + "s with status " + readinessNode.getEc2ReadinessStatus())
-                        .build();
+                throw new IOException("Node still not ready, timed out after " + (readinessTries * readinessSleepMs / 1000)
+                        + "s with status " + readinessNode.getEc2ReadinessStatus());
             }
         }
 
-        logInfo(computer, listener, "Launching instance: " + node.getInstanceId());
+        logInfo(computer, listener, "Launching Unix EC2 instance using local SSH: " + node.getInstanceId());
 
-        // TODO: parse the version number. maven-enforcer-plugin might help
-        final String javaPath = node.javaPath;
+        // Bootstrap SSH connection using local SSH client
+        boolean isBootstrapped = bootstrap(computer, listener, template);
+        if (!isBootstrapped) {
+            logWarning(computer, listener, "SSH bootstrap failed");
+            return;
+        }
+
+        // Apply boot delay if configured
+        int bootDelay = node.getBootDelay();
+        if (bootDelay > 0) {
+            logInfo(computer, listener, "SSH service responded. Waiting " + bootDelay + "ms for service to stabilize");
+            Thread.sleep(bootDelay);
+            logInfo(computer, listener, "SSH service should have stabilized");
+        }
+
+        // Prepare the Unix instance
+        prepareUnixInstance(computer, listener, node);
+
+        // Launch the Jenkins agent
+        launchJenkinsAgent(computer, listener, node);
+    }
+
+    /**
+     * Prepare the Unix instance for Jenkins agent
+     */
+    private void prepareUnixInstance(EC2Computer computer, TaskListener listener, EC2AbstractSlave node) 
+            throws IOException, InterruptedException {
+        
         String tmpDir = (Util.fixEmptyAndTrim(node.tmpDir) != null ? node.tmpDir : "/tmp");
-
-        try (SshClient client = SSHClientHelper.getInstance().setupSshClient(computer)) {
-            boolean isBootstrapped = bootstrap(computer, listener, template);
-            if (!isBootstrapped) {
-                logWarning(computer, listener, "bootstrapresult failed");
-                return; // bootstrap closed for us.
-            }
-            int bootDelay = node.getBootDelay();
-            if (bootDelay > 0) {
-                logInfo(
-                        computer,
-                        listener,
-                        "SSH service responded. Waiting " + bootDelay + "ms for service to stabilize");
-                Thread.sleep(bootDelay);
-                logInfo(computer, listener, "SSH service should have stabilized");
-            }
-
-            // connect fresh as ROOT
-            logInfo(computer, listener, "connect fresh as root");
-            try (ClientSession clientSession = connectToSsh(client, computer, listener, template)) {
-                KeyPair key = computer.getCloud().getKeyPair();
-
-                final boolean isAuthenticated;
-                if (key == null) {
-                    isAuthenticated = false;
+        String javaPath = node.javaPath;
+        
+        logInfo(computer, listener, "Preparing Unix instance for Jenkins agent");
+        
+        // Create temporary directory
+        executeSSHCommand(computer, listener, "mkdir -p " + tmpDir, 30);
+        
+        // Execute init script if provided
+        String initScript = node.initScript;
+        if (initScript != null && !initScript.trim().isEmpty()) {
+            logInfo(computer, listener, "Checking if init script needs to be executed");
+            
+            ProcessResult checkInit = executeSSHCommand(computer, listener, "test -e ~/.hudson-run-init", 30);
+            if (checkInit.exitCode != 0) {
+                logInfo(computer, listener, "Executing init script");
+                
+                // Create init script file
+                String createScript = String.format("cat > %s/init.sh << 'EOF'\n%s\nEOF", tmpDir, initScript);
+                executeSSHCommand(computer, listener, createScript, 60);
+                
+                // Make it executable and run
+                executeSSHCommand(computer, listener, "chmod +x " + tmpDir + "/init.sh", 30);
+                ProcessResult initResult = executeSSHCommand(computer, listener, 
+                    buildUpCommand(computer, tmpDir + "/init.sh"), 300);
+                
+                if (initResult.exitCode == 0) {
+                    executeSSHCommand(computer, listener, "touch ~/.hudson-run-init", 30);
+                    logInfo(computer, listener, "Init script executed successfully");
                 } else {
-                    clientSession.addPublicKeyIdentity(KeyHelper.decodeKeyPair(key.getMaterial(), ""));
-                    clientSession.auth().await(timeout);
-                    isAuthenticated = clientSession.isAuthenticated();
+                    throw new IOException("Init script failed with exit code: " + initResult.exitCode);
                 }
-                if (!isAuthenticated) {
-                    logWarning(computer, listener, "Authentication failed");
-                    return; // failed to connect as root.
-                }
-
-                try (CloseableScpClient scp = createScpClient(clientSession)) {
-                    String timestamp =
-                            Duration.ofMillis(System.currentTimeMillis()).toSeconds() + " 0";
-                    ScpTimestampCommandDetails scpTimestamp =
-                            ScpTimestampCommandDetails.parse("T" + timestamp + " " + timestamp);
-                    String initScript = node.initScript;
-
-                    logInfo(computer, listener, "Creating tmp directory (" + tmpDir + ") if it does not exist");
-                    executeRemote(clientSession, "mkdir -p " + tmpDir, logger);
-
-                    if (StringUtils.isNotBlank(initScript)
-                            && !executeRemote(clientSession, "test -e ~/.hudson-run-init", logger)) {
-                        logInfo(computer, listener, "Upload init script");
-                        scp.upload(
-                                initScript.getBytes(StandardCharsets.UTF_8),
-                                tmpDir + "/init.sh",
-                                List.of(
-                                        PosixFilePermission.OWNER_READ,
-                                        PosixFilePermission.OWNER_WRITE,
-                                        PosixFilePermission.OWNER_EXECUTE),
-                                scpTimestamp);
-
-                        logInfo(computer, listener, "Executing init script");
-                        String initCommand = buildUpCommand(computer, tmpDir + "/init.sh");
-                        // Set the flag only when init script executed successfully.
-                        if (executeRemote(clientSession, initCommand, logger)) {
-                            log(
-                                    Level.FINE,
-                                    computer,
-                                    listener,
-                                    "Init script executed successfully and creating ~/.hudson-run-init");
-                            String createHudsonRunInitCommand = buildUpCommand(computer, "touch ~/.hudson-run-init");
-                            if (!executeRemote(clientSession, createHudsonRunInitCommand, logger)) {
-                                logInfo(computer, listener, "Unable to create ~/.hudson-run-init");
-                            }
-                        } else {
-                            log(
-                                    Level.WARNING,
-                                    computer,
-                                    listener,
-                                    "Failed to execute init script on " + node.getInstanceId());
-                            clientSession.close();
-                            scp.close();
-                            client.stop();
-                            throw new IOException("Failed to execute init script on " + node.getInstanceId());
-                        }
-                    }
-
-                    executeRemote(
-                            computer,
-                            clientSession,
-                            javaPath + " -fullversion",
-                            "sudo amazon-linux-extras install java-openjdk11 -y; sudo yum install -y fontconfig java-11-openjdk",
-                            logger,
-                            listener);
-                    executeRemote(
-                            computer,
-                            clientSession,
-                            "which scp",
-                            "sudo yum install -y openssh-clients",
-                            logger,
-                            listener);
-
-                    // Always copy so we get the most recent remoting.jar
-                    logInfo(computer, listener, "Copying remoting.jar to: " + tmpDir);
-                    scp.upload(
-                            Jenkins.get().getJnlpJars("remoting.jar").readFully(),
-                            tmpDir + "/remoting.jar",
-                            List.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
-                            scpTimestamp);
-                }
+            } else {
+                logInfo(computer, listener, "Init script already executed (found ~/.hudson-run-init)");
             }
-            client.stop();
         }
-
-        final String jvmopts = node.jvmopts;
-        final String prefix = computer.getSlaveCommandPrefix();
-        final String suffix = computer.getSlaveCommandSuffix();
-        final String remoteFS = node.getRemoteFS();
-        final String workDir = Util.fixEmptyAndTrim(remoteFS) != null ? remoteFS : tmpDir;
-        String launchString = prefix
-                + " "
-                + javaPath
-                + " "
-                + (jvmopts != null ? jvmopts : "")
-                + " -jar "
-                + tmpDir
-                + "/remoting.jar -workDir "
-                + workDir
-                + suffix;
-        // launchString = launchString.trim();
-
-        if (template.isConnectBySSHProcess()) {
-            File identityKeyFile = createIdentityKeyFile(computer);
-            String ec2HostAddress = getEC2HostAddress(computer, template);
-            File hostKeyFile = createHostKeyFile(computer, ec2HostAddress, listener);
-            String userKnownHostsFileFlag = "";
-            if (hostKeyFile != null) {
-                userKnownHostsFileFlag = String.format(" -o \"UserKnownHostsFile=%s\"", hostKeyFile.getAbsolutePath());
+        
+        // Ensure Java is available
+        ProcessResult javaCheck = executeSSHCommand(computer, listener, javaPath + " -version", 30);
+        if (javaCheck.exitCode != 0) {
+            logInfo(computer, listener, "Java not found at " + javaPath + ", attempting to install");
+            
+            // Try to install Java
+            String installJava = "sudo amazon-linux-extras install java-openjdk11 -y || " +
+                                "sudo yum install -y fontconfig java-11-openjdk || " +
+                                "sudo apt-get update && sudo apt-get install -y openjdk-11-jdk";
+            executeSSHCommand(computer, listener, installJava, 300);
+            
+            // Verify Java installation
+            ProcessResult javaVerify = executeSSHCommand(computer, listener, "java -version", 30);
+            if (javaVerify.exitCode != 0) {
+                throw new IOException("Failed to install or find Java on the instance");
             }
-
-            try {
-                // Obviously the controller must have an installed ssh client.
-                // Depending on the strategy selected on the UI, we set the StrictHostKeyChecking flag
-                String sshClientLaunchString = String.format(
-                        "ssh -o StrictHostKeyChecking=%s%s%s -i %s %s@%s -p %d %s",
-                        template.getHostKeyVerificationStrategy().getSshCommandEquivalentFlag(),
-                        userKnownHostsFileFlag,
-                        getEC2HostKeyAlgorithmFlag(computer),
-                        identityKeyFile.getAbsolutePath(),
-                        node.remoteAdmin,
-                        ec2HostAddress,
-                        node.getSshPort(),
-                        launchString);
-
-                logInfo(
-                        computer,
-                        listener,
-                        "Launching remoting agent (via SSH client process): " + sshClientLaunchString);
-                CommandLauncher commandLauncher = new CommandLauncher(sshClientLaunchString, null);
-                commandLauncher.launch(computer, listener);
-            } finally {
-                if (!identityKeyFile.delete()) {
-                    LOGGER.log(Level.WARNING, "Failed to delete identity key file");
-                }
-                if (hostKeyFile != null && !hostKeyFile.delete()) {
-                    LOGGER.log(Level.WARNING, "Failed to delete host key file");
-                }
-            }
-        } else {
-            launchRemotingAgent(computer, listener, launchString, template, timeout, logger);
         }
+        
+        // Ensure SSH client tools are available
+        ProcessResult scpCheck = executeSSHCommand(computer, listener, "which scp", 30);
+        if (scpCheck.exitCode != 0) {
+            logInfo(computer, listener, "SCP not found, installing SSH client tools");
+            String installSsh = "sudo yum install -y openssh-clients || " +
+                               "sudo apt-get update && sudo apt-get install -y openssh-client";
+            executeSSHCommand(computer, listener, installSsh, 300);
+        }
+        
+        // Copy remoting.jar to the instance
+        logInfo(computer, listener, "Copying remoting.jar to: " + tmpDir);
+        copyRemotingJar(computer, listener, tmpDir);
+    }
+    
+    /**
+     * Copy Jenkins remoting.jar to the instance
+     */
+    private void copyRemotingJar(EC2Computer computer, TaskListener listener, String tmpDir) 
+            throws IOException, InterruptedException {
+        
+        // Get Jenkins master URL
+        String jenkinsUrl = getJenkinsUrl();
+        String remotingUrl = jenkinsUrl + "/jnlpJars/remoting.jar";
+        
+        // Download remoting.jar using curl or wget
+        String downloadCommand = String.format(
+            "curl -L -o %s/remoting.jar '%s' || wget -O %s/remoting.jar '%s'", 
+            tmpDir, remotingUrl, tmpDir, remotingUrl);
+        
+        ProcessResult downloadResult = executeSSHCommand(computer, listener, downloadCommand, 300);
+        
+        if (downloadResult.exitCode != 0) {
+            throw new IOException("Failed to download remoting.jar: " + downloadResult.output);
+        }
+        
+        // Verify the file was downloaded
+        ProcessResult verifyResult = executeSSHCommand(computer, listener, "ls -la " + tmpDir + "/remoting.jar", 30);
+        if (verifyResult.exitCode != 0) {
+            throw new IOException("remoting.jar not found after download");
+        }
+        
+        logInfo(computer, listener, "remoting.jar downloaded successfully");
+    }
+
+    /**
+     * Launch the Jenkins agent
+     */
+    private void launchJenkinsAgent(EC2Computer computer, TaskListener listener, EC2AbstractSlave node) 
+            throws IOException, InterruptedException {
+        
+        String tmpDir = (Util.fixEmptyAndTrim(node.tmpDir) != null ? node.tmpDir : "/tmp");
+        String javaPath = node.javaPath;
+        String jvmOpts = node.jvmopts != null ? node.jvmopts : "";
+        String prefix = computer.getSlaveCommandPrefix() != null ? computer.getSlaveCommandPrefix() : "";
+        String suffix = computer.getSlaveCommandSuffix() != null ? computer.getSlaveCommandSuffix() : "";
+        String remoteFS = node.getRemoteFS();
+        String workDir = Util.fixEmptyAndTrim(remoteFS) != null ? remoteFS : tmpDir;
+        
+        // Build the launch command - this should create a persistent SSH connection
+        String launchCommand = String.format("%s %s %s -jar %s/remoting.jar -workDir %s %s",
+            prefix.trim(), javaPath, jvmOpts, tmpDir, workDir, suffix.trim()).trim();
+        
+        logInfo(computer, listener, "Launching Jenkins agent with command: " + launchCommand);
+        
+        // Create persistent SSH connection for the agent (non-background)
+        SlaveTemplate template = computer.getSlaveTemplate();
+        String host = getHostAddress(computer, template);
+        String user = computer.getRemoteAdmin();
+        File keyFile = createIdentityKeyFile(computer);
+        
+        try {
+            List<String> sshCommand = buildSSHCommand(host, user, keyFile, launchCommand, template);
+            
+            logInfo(computer, listener, "Creating persistent SSH connection: " + String.join(" ", sshCommand));
+            
+            // Use CommandLauncher to create persistent connection like the original implementation
+            hudson.slaves.CommandLauncher commandLauncher = 
+                new hudson.slaves.CommandLauncher(String.join(" ", sshCommand), null);
+            commandLauncher.launch(computer, listener);
+            
+        } finally {
+            // Note: Don't delete keyFile here as the persistent connection needs it
+        }
+    }
+
+    /**
+     * Get Jenkins master URL
+     */
+    private String getJenkinsUrl() {
+        String rootUrl = Jenkins.get().getRootUrl();
+        if (rootUrl != null && !rootUrl.isEmpty()) {
+            return rootUrl.endsWith("/") ? rootUrl.substring(0, rootUrl.length() - 1) : rootUrl;
+        }
+        return "http://localhost:8080"; // fallback
+    }
+
+    protected String buildUpCommand(EC2Computer computer, String command) {
+        // For Unix systems, we can run commands as-is, but may need sudo for some operations
+        SlaveTemplate template = computer.getSlaveTemplate();
+        String defaultAdmin = "root";
+        
+        if (template != null && !template.isWindowsSlave()) {
+            String remoteAdmin = computer.getRemoteAdmin();
+            if (!"root".equals(remoteAdmin)) {
+                // If not running as root, prefix with sudo for system commands
+                if (command.contains("yum ") || command.contains("apt-get ") || command.startsWith("/")) {
+                    return "sudo " + command;
+                }
+            }
+        }
+        
+        return command;
     }
 }

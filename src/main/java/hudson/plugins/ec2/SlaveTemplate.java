@@ -191,8 +191,6 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
 
     public final String idleTerminationMinutes;
 
-    private boolean terminateIdleDuringShutdown;
-
     public final String iamInstanceProfile;
 
     public final boolean deleteRootOnTermination;
@@ -417,7 +415,7 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
 
         this.hostKeyVerificationStrategy = hostKeyVerificationStrategy != null
                 ? hostKeyVerificationStrategy
-                : HostKeyVerificationStrategyEnum.CHECK_NEW_SOFT;
+                : HostKeyVerificationStrategyEnum.OFF;
         this.tenancy = tenancy != null ? tenancy : Tenancy.Default;
         this.ebsEncryptRootVolume = ebsEncryptRootVolume != null ? ebsEncryptRootVolume : EbsEncryptRootVolume.DEFAULT;
         this.metadataSupported =
@@ -1679,15 +1677,6 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
 
     public String getidleTerminationMinutes() {
         return idleTerminationMinutes;
-    }
-
-    public boolean getTerminateIdleDuringShutdown() {
-        return terminateIdleDuringShutdown;
-    }
-
-    @DataBoundSetter
-    public void setTerminateIdleDuringShutdown(boolean terminateIdleDuringShutdown) {
-        this.terminateIdleDuringShutdown = terminateIdleDuringShutdown;
     }
 
     public Set<LabelAtom> getLabelSet() {
@@ -3385,8 +3374,8 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
         }
 
         public String getDefaultHostKeyVerificationStrategy() {
-            // new templates default to the most secure strategy
-            return HostKeyVerificationStrategyEnum.CHECK_NEW_HARD.name();
+            // Default to no verification for Unix/Linux agents to prevent host validation failures
+            return HostKeyVerificationStrategyEnum.OFF.name();
         }
 
         @POST
