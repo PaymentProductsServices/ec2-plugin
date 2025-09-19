@@ -171,15 +171,18 @@ public abstract class LocalSSHLauncher extends ComputerLauncher {
         List<String> cmd = new ArrayList<>();
         cmd.add("ssh");
         
-        // Connection options
+        // Connection options with improved keepalive settings
         cmd.add("-o");
         cmd.add("ConnectTimeout=30");
         
         cmd.add("-o");
-        cmd.add("ServerAliveInterval=60");
+        cmd.add("ServerAliveInterval=30");
         
         cmd.add("-o");
-        cmd.add("ServerAliveCountMax=3");
+        cmd.add("ServerAliveCountMax=10");
+        
+        cmd.add("-o");
+        cmd.add("TCPKeepAlive=yes");
         
         cmd.add("-o");
         cmd.add("BatchMode=yes");
