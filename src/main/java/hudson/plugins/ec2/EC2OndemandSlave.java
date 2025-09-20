@@ -439,11 +439,13 @@ public class EC2OndemandSlave extends EC2AbstractSlave {
                 numExecutors,
                 mode,
                 labelString,
-                (amiType.isWinRMAgent()
-                        ? new EC2WindowsLauncher()
-                        : (amiType.isWindows()
-                                ? new EC2WindowsSSHLauncher()
-                                : (amiType.isMac() ? new EC2MacLauncher() : new EC2UnixLauncher()))),
+                (connectionStrategy == ConnectionStrategy.WEBSOCKET
+                        ? new EC2WebSocketLauncher()
+                        : (amiType.isWinRMAgent()
+                                ? new EC2WindowsLauncher()
+                                : (amiType.isWindows()
+                                        ? new EC2WindowsSSHLauncher()
+                                        : (amiType.isMac() ? new EC2MacLauncher() : new EC2UnixLauncher())))),
                 new EC2RetentionStrategy(idleTerminationMinutes),
                 initScript,
                 tmpDir,

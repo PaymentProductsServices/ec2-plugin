@@ -1543,15 +1543,10 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     }
 
     public String getSlaveName(String instanceId) {
-        final String agentName = String.format("%s (%s)", getDisplayName(), instanceId);
-        try {
-            Jenkins.checkGoodName(agentName);
-            return agentName;
-        } catch (Failure e) {
-            return instanceId;
-        }
+        // Simply return the instance ID as the agent name
+        return instanceId;
     }
-
+    
     String getZone() {
         return zone;
     }

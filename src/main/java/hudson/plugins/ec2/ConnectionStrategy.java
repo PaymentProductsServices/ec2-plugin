@@ -4,7 +4,8 @@ public enum ConnectionStrategy {
     PUBLIC_DNS("Public DNS"),
     PUBLIC_IP("Public IP"),
     PRIVATE_DNS("Private DNS"),
-    PRIVATE_IP("Private IP");
+    PRIVATE_IP("Private IP"),
+    WEBSOCKET("Launch agent by connecting it to the controller (WebSocket)");
 
     private final String displayText;
 

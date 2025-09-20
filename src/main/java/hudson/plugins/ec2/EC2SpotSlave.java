@@ -144,9 +144,11 @@ public class EC2SpotSlave extends EC2AbstractSlave implements EC2Readiness {
                 numExecutors,
                 mode,
                 labelString,
-                (amiType.isWinRMAgent()
-                        ? new EC2WindowsLauncher()
-                        : (amiType.isWindows() ? new EC2WindowsSSHLauncher() : new EC2UnixLauncher())),
+                (connectionStrategy == ConnectionStrategy.WEBSOCKET
+                        ? new EC2WebSocketLauncher()
+                        : (amiType.isWinRMAgent()
+                                ? new EC2WindowsLauncher()
+                                : (amiType.isWindows() ? new EC2WindowsSSHLauncher() : new EC2UnixLauncher()))),
                 new EC2RetentionStrategy(idleTerminationMinutes),
                 initScript,
                 tmpDir,
