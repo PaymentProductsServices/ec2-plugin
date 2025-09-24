@@ -28,6 +28,7 @@ import hudson.slaves.JNLPLauncher;
 import hudson.slaves.SlaveComputer;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import software.amazon.awssdk.core.exception.SdkException;
@@ -50,16 +51,34 @@ public class EC2WebSocketLauncher extends JNLPLauncher {
     }
 
     @Override
+    public boolean isLaunchSupported() {
+        // WebSocket launcher supports launching
+        return true;
+    }
+
+    @Override
+    public void afterDisconnect(SlaveComputer computer, TaskListener listener) {
+        // Handle cleanup after WebSocket disconnection
+        final PrintStream logger = listener.getLogger();
+        LOGGER.info("WebSocket agent disconnected: " + computer.getName());
+        logger.println("WebSocket agent disconnected. Ready for reconnection.");
+        super.afterDisconnect(computer, listener);
+    }
+
+    @Override
     public void launch(SlaveComputer computer, TaskListener listener) {
         final PrintStream logger = listener.getLogger();
         
-        logger.println("WebSocket launcher selected for agent: " + computer.getName());
+        LOGGER.info("WebSocket launcher launching agent: " + computer.getName());
+        logger.println("🚀 WebSocket launcher selected for agent: " + computer.getName());
         
         // Setup the connection using the Jenkins controller URL
         String jenkinsUrl = Jenkins.get().getRootUrl();
         if (jenkinsUrl == null) {
-            logger.println("ERROR: Jenkins URL is not configured. Please set Jenkins URL in Jenkins configuration.");
-            return;
+            String errorMsg = "ERROR: Jenkins URL is not configured. Please set Jenkins URL in Jenkins configuration.";
+            LOGGER.severe(errorMsg);
+            logger.println(errorMsg);
+            throw new RuntimeException(errorMsg);
         }
         
         // Ensure Jenkins URL ends with slash
@@ -67,25 +86,34 @@ public class EC2WebSocketLauncher extends JNLPLauncher {
             jenkinsUrl += "/";
         }
         
-        logger.println("Jenkins URL: " + jenkinsUrl);
+        logger.println("✅ Jenkins URL: " + jenkinsUrl);
         
         // Generate the JNLP URL for the agent
         String jnlpUrl = generateAgentCommand(computer);
         if (jnlpUrl != null) {
-            logger.println("Agent JNLP URL: " + jnlpUrl);
-            logger.println("Your EC2 instance should connect using:");
-            logger.println("java -jar agent.jar -url " + jenkinsUrl + " -name " + computer.getName() + " -workDir /home/pcms-builder");
-            logger.println("Make sure to run as user 'pcms-builder' in directory '/home/pcms-builder'");
+            logger.println("✅ Agent JNLP URL: " + jnlpUrl);
+            logger.println("📋 EC2 instance should connect using:");
+            logger.println("   java -jar agent.jar -url " + jenkinsUrl + " -name " + computer.getName() + " -workDir /home/pcms-builder");
         }
         
-        logger.println("Configuring agent for inbound connection...");
+        logger.println("🔧 Configuring WebSocket agent for inbound connection...");
         
-        // Call the parent JNLPLauncher to set up the inbound agent properly
-        super.launch(computer, listener);
-        
-        logger.println("WebSocket launcher configured. Waiting for agent to connect...");
-        logger.println("The agent should connect automatically when the EC2 instance starts and runs the connection command.");
-        logger.println("Make sure your user data script downloads agent.jar and connects using the JNLP URL above.");
+        try {
+            // Call the parent JNLPLauncher to set up the inbound agent properly
+            // This should complete quickly and not block EC2 instance creation
+            super.launch(computer, listener);
+            
+            LOGGER.info("WebSocket launcher configured successfully for " + computer.getName());
+            logger.println("✅ WebSocket launcher configured successfully.");
+            logger.println("⏳ Waiting for EC2 instance to start and connect...");
+            logger.println("🌐 Agent will connect using WebSocket to: " + jenkinsUrl);
+            
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Error during WebSocket launcher setup for " + computer.getName(), e);
+            logger.println("❌ Error: " + e.getMessage());
+            // Re-throw to prevent EC2 instance creation with broken launcher
+            throw new RuntimeException("WebSocket launcher setup failed", e);
+        }
     }
     
     /**
